@@ -82,23 +82,32 @@ jobs:
             -inkey /tmp/key.pem -in /tmp/cert.pem \
             -name totk -passout env:APK_KEY_PASS
 
-      - name: Откат горячего ADPF и включение подсказки 60 Гц (-O3 + ThinLTO)
+      - name: Восстановление стокового поведения и применение только -O3 + ThinLTO
         run: |
-          # 1. Восстанавливаем стоковый спокойный android_perf.c
+          # 1. Стоковый android_perf.c (без ADPF-буста и без сброса герцовки до 30 Гц)
           for c in $(git log --format=%H -- games/totk/runtime/android_perf.c); do
             if ! git show "$c:games/totk/runtime/android_perf.c" | grep -q 'is_not_zero' \
                && git show "$c:games/totk/runtime/android_perf.c" | tail -n 5 | grep -q '^#endif'; then
               git show "$c:games/totk/runtime/android_perf.c" > games/totk/runtime/android_perf.c
-              echo "Восстановлен спокойный android_perf.c из $c"
+              echo "Восстановлен стоковый android_perf.c из $c"
               break
             fi
           done
 
-          # 2. Восстанавливаем чистый TotkActivity.java (без блокировки 120 Гц)
+          # 2. Стоковый android_thermal.c (убираем принудительный сброс на 30 FPS на 30 сек)
+          for c in $(git log --format=%H -- games/totk/runtime/android_thermal.c); do
+            if git show "$c:games/totk/runtime/android_thermal.c" | grep -q 'launch = e && !strcmp(e, "1");'; then
+              git show "$c:games/totk/runtime/android_thermal.c" > games/totk/runtime/android_thermal.c
+              echo "Восстановлен стоковый android_thermal.c из $c"
+              break
+            fi
+          done
+
+          # 3. Стоковый TotkActivity.java + только FLAG_KEEP_SCREEN_ON
           for c in $(git log --format=%H -- games/totk/android/java/com/aure/totk/TotkActivity.java); do
             if ! git show "$c:games/totk/android/java/com/aure/totk/TotkActivity.java" | grep -q 'keep120HzDisplay'; then
               git show "$c:games/totk/android/java/com/aure/totk/TotkActivity.java" > games/totk/android/java/com/aure/totk/TotkActivity.java
-              echo "Восстановлен чистый TotkActivity.java из $c"
+              echo "Восстановлен стоковый TotkActivity.java из $c"
               break
             fi
           done
@@ -106,15 +115,6 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          # Включаем только подсказку герцовки под выбранный FPS (TOTK_FRAME_RATE_HINT=1)
-          pf = Path('games/totk/runtime/android_perf.c')
-          pt = pf.read_text()
-          old_rate = 'rate_on = is_one("TOTK_FRAME_RATE_HINT");'
-          new_rate = 'rate_on = (!getenv("TOTK_FRAME_RATE_HINT") || strcmp(getenv("TOTK_FRAME_RATE_HINT"), "0") != 0);'
-          assert old_rate in pt, 'Строка TOTK_FRAME_RATE_HINT не найдена в android_perf.c'
-          pf.write_text(pt.replace(old_rate, new_rate, 1))
-
-          # Только запрет выключения экрана (без принудительных 120 Гц)
           ja = Path('games/totk/android/java/com/aure/totk/TotkActivity.java')
           jt = ja.read_text()
           if jt.startswith('Package '):
@@ -125,7 +125,6 @@ jobs:
               jt = jt.replace('super.onCreate(state);', 'super.onCreate(state);\n        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);', 1)
           ja.write_text(jt)
 
-          # Оптимизация компиляции (-O3 + ThinLTO)
           mk = Path('games/totk/android/Makefile')
           mk.write_text(mk.read_text().replace(
               'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)',
@@ -134,7 +133,7 @@ jobs:
           br.write_text(br.read_text().replace(
               "'GPU=vk', f'DEV_BUILD={0 if release else 1}'",
               "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'", 1))
-          print('Холодная конфигурация с автоподстройкой герцовки применена')
+          print('Чистая сборка с -O3 + ThinLTO готова')
           PY
 
       - name: Сборка APK
