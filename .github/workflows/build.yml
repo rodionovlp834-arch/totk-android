@@ -7,7 +7,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Скачивание кода и библиотек
+      - name: Скачивание репозитория
         uses: actions/checkout@v4
         with:
           submodules: recursive
@@ -18,35 +18,74 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Установка Python
+      - name: Установка Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Настройка Android SDK, NDK и build-tools
-        run: |
-          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
-          NDK_DIR=$(ls -d "$ANDROID_HOME/ndk/"* 2>/dev/null | sort -V | tail -n 1)
-          if [ -n "$NDK_DIR" ]; then
-            echo "ANDROID_NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
-            echo "ANDROID_NDK_ROOT=$NDK_DIR" >> $GITHUB_ENV
-            echo "NDK_HOME=$NDK_DIR" >> $GITHUB_ENV
-          fi
-          BT_DIR=$(ls -d "$ANDROID_HOME/build-tools/"* 2>/dev/null | sort -V | tail -n 1)
-          if [ -n "$BT_DIR" ]; then
-            echo "$BT_DIR" >> $GITHUB_PATH
-          fi
+      - name: Установка .NET 10 SDK
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: '10.0.x'
 
-      - name: Сборка APK через build_app.py
+      - name: Установка зависимостей сборки
         run: |
-          python3 build_app.py || {
-            echo "=== СПРАВКА build_app.py ==="
-            python3 build_app.py --help || true
+          pip install cryptography==50.0.2
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake ninja-build nasm yasm pkg-config autoconf automake libtool unzip
+
+      - name: Установка Android NDK r28 и SDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;28.2.13676358" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Извлечение драйвера Turnip из релиза v1.0.1
+        run: |
+          curl -fL "https://github.com/AurelioB/totk-android/releases/download/v1.0.1/TotK-Native-1.0.1.apk" -o /tmp/ref.apk
+          unzip -q /tmp/ref.apk -d /tmp/ref_apk
+          TURNIP_PATH=$(find /tmp/ref_apk -type f -exec sha256sum {} + | awk '$1=="9b87afeb3d8d30c6a0ad5aab3e0703bc1500e0321e9f17a922106fa556389ec6" {sub(/^[^ ]+ +/, ""); print; exit}')
+          if [ -z "$TURNIP_PATH" ]; then
+            echo "ОШИБКА: драйвер Turnip с нужным SHA-256 не найден в релизном APK"
             exit 1
-          }
+          fi
+          cp "$TURNIP_PATH" /tmp/turnip_driver.so
+
+      - name: Создание временного ключа подписи (.p12)
+        env:
+          APK_KEY_PASS: totk-build-pass-1234
+        run: |
+          openssl req -x509 -newkey rsa:2048 \
+            -keyout /tmp/key.pem -out /tmp/cert.pem \
+            -days 10000 -nodes -subj "/CN=TotKCustom"
+          openssl pkcs12 -export \
+            -out /tmp/release.p12 \
+            -inkey /tmp/key.pem -in /tmp/cert.pem \
+            -name totk -passout env:APK_KEY_PASS
+
+      - name: Сборка APK через build_release.py
+        env:
+          APK_KEY_PASS: totk-build-pass-1234
+        run: |
+          EXTRA_ARGS=""
+          if [ -f "games/totk/prebuilt/android-arm64/totk_xlate" ]; then
+            EXTRA_ARGS="--translator games/totk/prebuilt/android-arm64/totk_xlate"
+          fi
+          python3 games/totk/android/build_release.py \
+            --ndk "$ANDROID_HOME/ndk/28.2.13676358" \
+            --turnip /tmp/turnip_driver.so \
+            --key /tmp/release.p12 \
+            --key-pass-env APK_KEY_PASS \
+            $EXTRA_ARGS \
+            -o /tmp/totk-native.apk
+          mkdir -p out
+          cp /tmp/totk-native.apk out/totk-native.apk
 
       - name: Выгрузка готового APK
         uses: actions/upload-artifact@v4
         with:
           name: TotK-Native-APK
-          path: "**/*.apk"
+          path: out/totk-native.apk
