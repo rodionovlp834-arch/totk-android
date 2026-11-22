@@ -142,7 +142,9 @@ public final class TotkActivity extends NativeActivity {
             presentRoot = null; presentHintListener = null; presentEpoch = 0;
             nativePresentTransformHint(epoch, -1);
         }
-    }    private void keep120HzDisplay() {
+    }
+
+    private void keep120HzDisplay() {
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         Display display = getDisplay();
         if (display == null) return;
@@ -157,14 +159,15 @@ public final class TotkActivity extends NativeActivity {
             }
         }
         WindowManager.LayoutParams lp = getWindow().getAttributes();
-        if (lp.preferredDisplayModeId != best.getModeId() || lp.preferredRefreshRate != best.getRefreshRate()) {
+        if (lp.preferredDisplayModeId != best.getModeId()) {
             lp.preferredDisplayModeId = best.getModeId();
-            lp.preferredRefreshRate = best.getRefreshRate();
             getWindow().setAttributes(lp);
         }
     }
+
     @Override protected void onCreate(Bundle state) {
-        super.onCreate(state);        keep120HzDisplay();
+        super.onCreate(state);
+        keep120HzDisplay();
         // NativeActivity synchronously loads totk.env in ANativeActivity_onCreate.
         // Query only after super, before constructing a controller or display listener.
         // The companion art is generated on the device by the optional setup stage; without it the companion stays off.
@@ -210,7 +213,8 @@ public final class TotkActivity extends NativeActivity {
     }
     @Override protected void onResume() {
         super.onResume();
-        resumed = true;        keep120HzDisplay();
+        resumed = true;
+        keep120HzDisplay();
         ensureMainDisplay();
         GameFeedback f = feedback;
         if (f != null) f.resume();
@@ -222,7 +226,8 @@ public final class TotkActivity extends NativeActivity {
         if (companion != null) companion.ownerTopResumed(top);
     }
     @Override public void onWindowFocusChanged(boolean focused) {
-        super.onWindowFocusChanged(focused);        if (focused) keep120HzDisplay();
+        super.onWindowFocusChanged(focused);
+        if (focused) keep120HzDisplay();
         // Quickstep can leave the live recents tile RESUMED. On one display,
         // focus loss must pause too, and focus return need not call onResume.
         // Never apply that policy to multi-resume on a second display.
