@@ -10,6 +10,7 @@ jobs:
       - name: Скачивание репозитория
         uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           submodules: recursive
 
       - name: Установка Java 21
@@ -81,12 +82,44 @@ jobs:
             -inkey /tmp/key.pem -in /tmp/cert.pem \
             -name totk -passout env:APK_KEY_PASS
 
-      - name: Сборка APK с автооткатом флагов компиляции
-        env:
-          APK_KEY_PASS: totk-build-pass-1234
+      - name: Восстановление android_perf.c и применение всех оптимизаций
         run: |
+          for c in $(git log --format=%H -- games/totk/runtime/android_perf.c); do
+            if git show "$c:games/totk/runtime/android_perf.c" | tail -n 5 | grep -q '^#endif'; then
+              git show "$c:games/totk/runtime/android_perf.c" > games/totk/runtime/android_perf.c
+              echo "Восстановлен целый android_perf.c из коммита $c"
+              break
+            fi
+          done
+
           python3 - <<'PY'
           from pathlib import Path
+
+          # 1. Патч android_perf.c (полный ADPF + CPU/GPU split + load hint)
+          pf = Path('games/totk/runtime/android_perf.c')
+          t = pf.read_text()
+          if 'is_not_zero' not in t:
+              old1 = 'static int is_one(const char *name) { const char *s = getenv(name); return s && !strcmp(s, "1"); }'
+              new1 = old1 + '\nstatic int is_not_zero(const char *name) { const char *s = getenv(name); return !s || strcmp(s, "0") != 0; }'
+              assert old1 in t, 'is_one не найден в android_perf.c'
+              t = t.replace(old1, new1, 1)
+
+              old2 = 'mode = request && !strcmp(request, "0") ? 0 : request && !strcmp(request, "full") ? 2 : 1;'
+              new2 = 'mode = request && !strcmp(request, "0") ? 0 : (request && (!strcmp(request, "1") || !strcmp(request, "legacy"))) ? 1 : 2;'
+              assert old2 in t, 'строка mode не найдена в android_perf.c'
+              t = t.replace(old2, new2, 1)
+
+              for var in ('span_applied = span_launch', 'load_applied = load_launch', 'cpu_split_applied = cpu_split_launch'):
+                  t = t.replace(f'{var} = is_one(', f'{var} = is_not_zero(', 1)
+              pf.write_text(t)
+
+          # 2. Защита от случайной заглавной буквы в TotkActivity.java
+          ja = Path('games/totk/android/java/com/aure/totk/TotkActivity.java')
+          jt = ja.read_text()
+          if jt.startswith('Package '):
+              ja.write_text('package ' + jt[8:])
+
+          # 3. Оптимизация компиляции (-O3 + ThinLTO)
           mk = Path('games/totk/android/Makefile')
           mk.write_text(mk.read_text().replace(
               'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)',
@@ -95,8 +128,13 @@ jobs:
           br.write_text(br.read_text().replace(
               "'GPU=vk', f'DEV_BUILD={0 if release else 1}'",
               "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'", 1))
+          print('Все патчи успешно применены')
           PY
 
+      - name: Сборка APK
+        env:
+          APK_KEY_PASS: totk-build-pass-1234
+        run: |
           run_build() {
             python3 games/totk/android/build_release.py \
               --ndk "$ANDROID_HOME/ndk/28.2.13676358" \
