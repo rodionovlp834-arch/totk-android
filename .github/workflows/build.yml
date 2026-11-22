@@ -115,7 +115,6 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          # Жёсткий замок окна на 60 Гц (убирает просадки от касаний LTPO) + запрет сна экрана
           ja = Path('games/totk/android/java/com/aure/totk/TotkActivity.java')
           jt = ja.read_text()
           if jt.startswith('Package '):
@@ -124,39 +123,38 @@ jobs:
               jt = jt.replace('import android.view.View;', 'import android.view.View;\nimport android.view.WindowManager;', 1)
 
           lock_method = """
-    private void lock60HzDisplay() {
-        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-        Display display = getDisplay();
-        if (display == null) return;
-        Display.Mode current = display.getMode();
-        if (current == null) return;
-        Display.Mode target = current;
-        float bestDiff = Math.abs(current.getRefreshRate() - 60.0f);
-        for (Display.Mode m : display.getSupportedModes()) {
-            if (m.getPhysicalWidth() == current.getPhysicalWidth()
-                    && m.getPhysicalHeight() == current.getPhysicalHeight()) {
-                float diff = Math.abs(m.getRefreshRate() - 60.0f);
-                if (diff < bestDiff) {
-                    bestDiff = diff;
-                    target = m;
-                }
-            }
-        }
-        WindowManager.LayoutParams lp = getWindow().getAttributes();
-        if (lp.preferredDisplayModeId != target.getModeId() || lp.preferredRefreshRate != target.getRefreshRate()) {
-            lp.preferredDisplayModeId = target.getModeId();
-            lp.preferredRefreshRate = target.getRefreshRate();
-            getWindow().setAttributes(lp);
-        }
-    }
-"""
+              private void lock60HzDisplay() {
+                  getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+                  Display display = getDisplay();
+                  if (display == null) return;
+                  Display.Mode current = display.getMode();
+                  if (current == null) return;
+                  Display.Mode target = current;
+                  float bestDiff = Math.abs(current.getRefreshRate() - 60.0f);
+                  for (Display.Mode m : display.getSupportedModes()) {
+                      if (m.getPhysicalWidth() == current.getPhysicalWidth()
+                              && m.getPhysicalHeight() == current.getPhysicalHeight()) {
+                          float diff = Math.abs(m.getRefreshRate() - 60.0f);
+                          if (diff < bestDiff) {
+                              bestDiff = diff;
+                              target = m;
+                          }
+                      }
+                  }
+                  WindowManager.LayoutParams lp = getWindow().getAttributes();
+                  if (lp.preferredDisplayModeId != target.getModeId() || lp.preferredRefreshRate != target.getRefreshRate()) {
+                      lp.preferredDisplayModeId = target.getModeId();
+                      lp.preferredRefreshRate = target.getRefreshRate();
+                      getWindow().setAttributes(lp);
+                  }
+              }
+          """
           jt = jt.replace('@Override protected void onCreate(Bundle state) {', lock_method + '\n    @Override protected void onCreate(Bundle state) {', 1)
           jt = jt.replace('super.onCreate(state);', 'super.onCreate(state);\n        lock60HzDisplay();', 1)
           jt = jt.replace('resumed = true;', 'resumed = true;\n        lock60HzDisplay();', 1)
           jt = jt.replace('super.onWindowFocusChanged(focused);', 'super.onWindowFocusChanged(focused);\n        if (focused) lock60HzDisplay();', 1)
           ja.write_text(jt)
 
-          # Оптимизация компилятора (-O3 + ThinLTO)
           mk = Path('games/totk/android/Makefile')
           mk.write_text(mk.read_text().replace(
               'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)',
