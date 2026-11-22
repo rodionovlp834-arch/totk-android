@@ -28,11 +28,25 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
+      - name: Фиксация .NET 10 SDK (вместо 11.0.100)
+        run: |
+          SDK10=$(dotnet --list-sdks | awk '/^10\./ {print $1}' | sort -V | tail -n 1)
+          if [ -z "$SDK10" ]; then
+            echo "ОШИБКА: .NET 10 SDK не найден"
+            dotnet --list-sdks
+            exit 1
+          fi
+          printf '{\n  "sdk": {\n    "version": "%s",\n    "rollForward": "latestPatch"\n  }\n}\n' "$SDK10" > ../global.json
+          for d in $(dotnet --list-sdks | awk '/^11\./ {gsub(/[\[\]]/, "", $2); print $2 "/" $1}'); do
+            sudo rm -rf "$d"
+          done
+          echo "Активная версия dotnet: $(dotnet --version)"
+
       - name: Установка зависимостей сборки
         run: |
           pip install cryptography==50.0.2
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake ninja-build nasm yasm pkg-config autoconf automake libtool unzip
+          sudo apt-get install -y -qq cmake ninja-build nasm yasm pkg-config autoconf automake libtool unzip clang lld zlib1g-dev
 
       - name: Установка Android NDK r28 и SDK
         run: |
@@ -42,6 +56,7 @@ jobs:
             "platforms;android-35" \
             "build-tools;35.0.0"
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
 
       - name: Извлечение драйвера Turnip из релиза v1.0.1
         run: |
@@ -49,7 +64,7 @@ jobs:
           unzip -q /tmp/ref.apk -d /tmp/ref_apk
           TURNIP_PATH=$(find /tmp/ref_apk -type f -exec sha256sum {} + | awk '$1=="9b87afeb3d8d30c6a0ad5aab3e0703bc1500e0321e9f17a922106fa556389ec6" {sub(/^[^ ]+ +/, ""); print; exit}')
           if [ -z "$TURNIP_PATH" ]; then
-            echo "ОШИБКА: драйвер Turnip с нужным SHA-256 не найден в релизном APK"
+            echo "ОШИБКА: драйвер Turnip с нужным SHA-256 не найден"
             exit 1
           fi
           cp "$TURNIP_PATH" /tmp/turnip_driver.so
@@ -70,17 +85,16 @@ jobs:
         env:
           APK_KEY_PASS: totk-build-pass-1234
         run: |
-          EXTRA_ARGS=""
-          if [ -f "games/totk/prebuilt/android-arm64/totk_xlate" ]; then
-            EXTRA_ARGS="--translator games/totk/prebuilt/android-arm64/totk_xlate"
-          fi
           python3 games/totk/android/build_release.py \
             --ndk "$ANDROID_HOME/ndk/28.2.13676358" \
             --turnip /tmp/turnip_driver.so \
             --key /tmp/release.p12 \
             --key-pass-env APK_KEY_PASS \
-            $EXTRA_ARGS \
-            -o /tmp/totk-native.apk
+            -o /tmp/totk-native.apk || {
+              echo "=== ПОСЛЕДНИЕ СТРОКИ ЛОГОВ ==="
+              tail -n 40 games/totk/build/release/logs/*.log 2>/dev/null || true
+              exit 1
+            }
           mkdir -p out
           cp /tmp/totk-native.apk out/totk-native.apk
 
