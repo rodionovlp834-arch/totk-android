@@ -97,7 +97,7 @@ static void log_refinements(void) {
 }
 static void configure(void) {
     const char *request = getenv("TOTK_ADPF"), *target = getenv("TOTK_ADPF_TARGET_MS");
-        mode = request && !strcmp(request, "0") ? 0 : (request && (!strcmp(request, "1") || !strcmp(request, "legacy"))) ? 1 : 2;
+    mode = request && !strcmp(request, "0") ? 0 : (request && (!strcmp(request, "1") || !strcmp(request, "legacy"))) ? 1 : 2;
     double ms = target && *target ? atof(target) : 33.3;
     legacy_target = ms > 0 && ms < 1000 ? (int64_t)(ms * 1e6) : 0;
     if (mode == 1 && !legacy_target) mode = 0;
@@ -112,9 +112,9 @@ static void configure(void) {
     }
     const char *slots = getenv("TOTK_PRESENT_SLOTS"), *cap = getenv("TOTK_UNCAPPED_HZ");
     auto40 = slots && !strcmp(slots, "auto") && is_one("TOTK_UNCAPPED") && cap && !strcmp(cap, "40");
-    span_applied = span_launch = is_one("TOTK_ADPF_GPU");
-    load_applied = load_launch = is_one("TOTK_ADPF_LOAD_HINT");
-    cpu_split_applied = cpu_split_launch = is_one("TOTK_ADPF_CPU_SPLIT");
+    span_applied = span_launch = is_not_zero("TOTK_ADPF_GPU");
+    load_applied = load_launch = is_not_zero("TOTK_ADPF_LOAD_HINT");
+    cpu_split_applied = cpu_split_launch = is_not_zero("TOTK_ADPF_CPU_SPLIT");
     const char *pct = getenv("TOTK_ADPF_TARGET_PCT");
     while (pct && isspace((unsigned char)*pct)) pct++;
     if (pct && *pct && !totk_live_decimal(pct, 50, 100, &target_pct_launch)) {
@@ -310,150 +310,4 @@ static void span_report(uint64_t start, uint64_t span, uint64_t queue_wait) {   
         }
         unsigned changes = totk_adpf_report_span(&session, &api, start, span,
             totk_adpf_cpu(span, queue_wait, cpu_split_applied), gpu);
-        span_stats.spans++; span_stats.span_sum += span;
-        if (span > span_stats.span_max) span_stats.span_max = span;
-        if (gpu) {
-            span_stats.gpus++; span_stats.gpu_sum += gpu;
-            if (gpu > span_stats.gpu_max) span_stats.gpu_max = gpu;
-        }
-        span_stats.errors += !!changes;
-        log_changes(changes);
-    }
-    else load_history.over = 0;
-    if (span_stats.frames < 300) return;
-    fprintf(stderr, "[totk-perf] ADPF span: %u frames, %u reported, span avg %.2f max %.2f ms; GPU %u reported, avg %.2f max %.2f ms; target %.3fms; %u report errors; increase hints %u sent, %u errors\n",
-        span_stats.frames, span_stats.spans, span_stats.spans ? span_stats.span_sum / 1e6 / span_stats.spans : 0.0,
-        span_stats.span_max / 1e6, span_stats.gpus, span_stats.gpus ? span_stats.gpu_sum / 1e6 / span_stats.gpus : 0.0,
-        span_stats.gpu_max / 1e6, session.target / 1e6, span_stats.errors, span_stats.hints, span_stats.hint_errors);
-    memset(&span_stats, 0, sizeof span_stats);
-}
-void totk_perf_generated(void) { atomic_fetch_add_explicit(&generated_presents, 1, memory_order_relaxed); }
-/* The rate hint, once per guest present: the configured rate, or with TOTK_RATE_HINT_HOLD the output rate held. */
-static void rate_frame(int guest_interval, int64_t target) {
-    int hold_ms = totk_live_cached(&hold_live, "TOTK_RATE_HINT_HOLD", hold_launch);
-    if (hold_ms != hold_logged) {
-        fprintf(stderr, "[totk-perf] TOTK_RATE_HINT_HOLD=%d ms (live)\n", hold_ms);
-        hold_logged = hold_ms; memset(&rate_hold, 0, sizeof rate_hold);
-    }
-    unsigned hz = totk_frame_rate(target == 16666667 ? 60 : 30, framegen, lattice);
-    if (hold_ms > 0) {
-        uint64_t generated = atomic_load_explicit(&generated_presents, memory_order_relaxed);
-        int generating = generated != generated_seen;
-        generated_seen = generated;
-        hz = totk_rate_hold_step(&rate_hold, totk_output_rate(guest_interval, generating, lattice),
-            mono_ns(), (uint64_t)hold_ms * 1000000);
-    }
-    hz = totk_frame_rate_minimum(auto40 && fps60 && !framegen, hz);
-    atomic_store_explicit(&content_rate, hz, memory_order_relaxed);
-}
-void totk_perf_frame(uint64_t now, uint64_t period, uint64_t pacing, int guest_interval) {
-    pthread_once(&config_once, configure);
-    runtime_thermal_frame(guest_interval > 0 ? (unsigned)guest_interval : 1u);
-    int64_t target = totk_adpf_target(period, fps60, framegen);
-    if (rate_on) rate_frame(guest_interval, target);
-    if (!mode) return;
-    int span = span_on();
-    if (mode != 2 && !span && !span_applied) return;   /* the legacy session reports from totk_perf_render */
-    /* The frame boundary: the next submit starts the next frame. */
-    uint64_t end = mono_ns(), start = atomic_exchange_explicit(&frame_start, 0, memory_order_relaxed);
-    if (mode == 2) {
-        static _Thread_local int registered;
-        if (!registered) { totk_perf_thread("render"); registered = 1; }
-    }
-    pthread_mutex_lock(&mu);
-    uint64_t inside = totk_adpf_pacing_in_span(&span_pacing, start, end);
-    span_pacing.n = 0;
-    uint64_t queue_wait = totk_adpf_pacing_in_span(&span_queue_wait, start, end);
-    span_queue_wait.n = 0;
-    int split = totk_live_cached(&cpu_split_live, "TOTK_ADPF_CPU_SPLIT", cpu_split_launch);
-    if (split != cpu_split_applied) {
-        atomic_store_explicit(&cpu_split_applied, split, memory_order_relaxed);
-        queue_wait = 0; /* first newly enabled frame has no complete queue-wait history */
-        fprintf(stderr, "[totk-perf] TOTK_ADPF_CPU_SPLIT=%d (live): %s\n", split,
-            api.work ? "CPU=span minus present/texture queue wait; total unchanged" : "unavailable, no-op");
-    }
-    int pct = totk_live_cached(&target_pct_live, "TOTK_ADPF_TARGET_PCT", target_pct_launch);
-    if (pct != target_pct_applied) {
-        target_pct_applied = pct; load_history.over = 0;
-        fprintf(stderr, "[totk-perf] TOTK_ADPF_TARGET_PCT=%d (live): target %.3fms; needs TOTK_ADPF_GPU=1\n",
-            pct, totk_adpf_span_target(fps60, framegen, pct) / 1e6);
-    }
-    if (span != span_applied) {
-        span_applied = span; memset(&span_stats, 0, sizeof span_stats);
-        load_history.over = 0;
-        /* A GPU frame published before the switch is not this session's to report. */
-        gpu_seen = (uint32_t)(atomic_load_explicit(&gpu_published, memory_order_relaxed) >> 32);
-        log_span(span, "live");
-        start = 0;   /* this frame's start may predate the switch: the next frame is the first whole one */
-    }
-    if (span) target = totk_adpf_span_target(fps60, framegen, target_pct_applied);
-    else if (mode == 1) target = legacy_target;
-    if (mode == 1) {
-        if (session.count && target != session.target)
-            log_changes(totk_adpf_sync(&session, &api, session.tids, session.count, target));
-        if (span) span_report(start, totk_adpf_span(start, end, inside), queue_wait);
-        pthread_mutex_unlock(&mu);
-        return;
-    }
-    uint64_t work = totk_adpf_work(previous_frame, now, pacing);
-    previous_frame = now;
-    if (registry_dirty || !frames || ++frames % 300 == 0) {
-        uint64_t elapsed = sample_time && now > sample_time ? now - sample_time : 0;
-        for (unsigned i = 0; i < 256; i++) if (registry[i].tid) {
-            uint64_t cpu = cpu_time(registry[i].clock);
-            registry[i].used = cpu >= registry[i].cpu && registry[i].cpu ? cpu - registry[i].cpu : 0;
-            registry[i].cpu = cpu;
-        }
-        int32_t tids[TOTK_ADPF_MAX_THREADS]; size_t n = 0;
-        for (unsigned i = 0; i < 256 && n < TOTK_ADPF_MAX_THREADS; i++)
-            if (registry[i].tid && registry[i].critical) tids[n++] = registry[i].tid;
-        /* Up to six busy guest/job threads, not idle I/O or background compilers. */
-        for (unsigned k = 0; k < 6 && n < TOTK_ADPF_MAX_THREADS && elapsed; k++) {
-            int best = -1;
-            for (unsigned i = 0; i < 256; i++) if (registry[i].tid && !registry[i].critical &&
-                    registry[i].used >= elapsed * 15 / 100 && (best < 0 || registry[i].used > registry[best].used)) best = (int)i;
-            if (best < 0) break;
-            tids[n++] = registry[best].tid; registry[best].used = 0;
-        }
-        for (size_t i = 1; i < n; i++) for (size_t j = i; j && tids[j] < tids[j - 1]; j--) {
-            int32_t t = tids[j]; tids[j] = tids[j - 1]; tids[j - 1] = t;
-        }
-        log_changes(totk_adpf_sync(&session, &api, tids, n, target));
-        sample_time = now; registry_dirty = 0; frames = 1;
-    } else if (target != session.target) {
-        log_changes(totk_adpf_sync(&session, &api, session.tids, session.count, target));
-    }
-    if (span) span_report(start, totk_adpf_span(start, end, inside), queue_wait);
-    else log_changes(totk_adpf_report(&session, &api, work));
-    pthread_mutex_unlock(&mu);
-}
-unsigned totk_perf_rate_request(void) {
-    pthread_once(&config_once, configure);
-    return rate_request;
-}
-void totk_perf_rate_override(float hz) {
-    pthread_once(&config_once, configure);
-    atomic_store_explicit(&rate_override, rate_on && hz > 0 && hz <= 2147483647.0f &&
-        (rate_request == UINT32_MAX || hz == rate_request) ? hz : 0, memory_order_relaxed);
-}
-float totk_perf_rate(void) {
-    pthread_once(&config_once, configure);
-    if (!rate_on) return 0;
-    float override = atomic_load_explicit(&rate_override, memory_order_relaxed);
-    return override ? override : atomic_load_explicit(&content_rate, memory_order_relaxed);
-}
-void totk_perf_window(ANativeWindow *window) {
-    float hz = totk_perf_rate();
-    if (!hz || !window) return;
-    int result = window_rate ? window_rate(window, hz, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE) : -1;
-    fprintf(stderr, "[totk-perf] window frame-rate hint=%.3f FIXED_SOURCE result=%d (request, not observed mode)\n", hz, result);
-}
-void totk_perf_surface(ASurfaceTransaction *tx, ASurfaceControl *surface) {
-    float hz = totk_perf_rate();
-    if (!hz || !surface || !tx) return;
-    /* Only seamless switches: a rate request must not black-screen mid-play. */
-    if (surface_rate) surface_rate(tx, surface, hz, ANATIVEWINDOW_FRAME_RATE_COMPATIBILITY_FIXED_SOURCE, 0);
-    fprintf(stderr, "[totk-perf] SurfaceControl frame-rate hint=%.3f FIXED_SOURCE seamless-only %s (void API; not mode proof)\n",
-        hz, surface_rate ? "staged" : "unavailable");
-}
-#endif
+        span_stats.spans++; span
