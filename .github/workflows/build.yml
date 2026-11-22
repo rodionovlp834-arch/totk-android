@@ -81,6 +81,27 @@ jobs:
             -inkey /tmp/key.pem -in /tmp/cert.pem \
             -name totk -passout env:APK_KEY_PASS
 
+      - name: Применение флагов Oryon (-O3 + ThinLTO) к Makefile и build_release.py
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          mk = Path('games/totk/android/Makefile')
+          t = mk.read_text()
+          old_mk = 'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)'
+          new_mk = 'COMMON := $(PREFIX_MAP) -O3 -march=armv8.6-a+crypto+dotprod+fp16 -g $(PICFLAG)'
+          assert old_mk in t, 'Строка COMMON не найдена в Makefile'
+          mk.write_text(t.replace(old_mk, new_mk, 1))
+
+          br = Path('games/totk/android/build_release.py')
+          t = br.read_text()
+          old_br = "'GPU=vk', f'DEV_BUILD={0 if release else 1}'"
+          new_br = "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'"
+          assert old_br in t, 'Строка make не найдена в build_release.py'
+          br.write_text(t.replace(old_br, new_br, 1))
+          print('Патчи Makefile и build_release.py успешно применены')
+          PY
+
       - name: Сборка APK через build_release.py
         env:
           APK_KEY_PASS: totk-build-pass-1234
