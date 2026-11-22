@@ -81,41 +81,48 @@ jobs:
             -inkey /tmp/key.pem -in /tmp/cert.pem \
             -name totk -passout env:APK_KEY_PASS
 
-      - name: Применение флагов Oryon (-O3 + ThinLTO) к Makefile и build_release.py
-        run: |
-          python3 - <<'PY'
-          from pathlib import Path
-
-          mk = Path('games/totk/android/Makefile')
-          t = mk.read_text()
-          old_mk = 'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)'
-          new_mk = 'COMMON := $(PREFIX_MAP) -O3 -march=armv8.6-a+crypto+dotprod+fp16 -g $(PICFLAG)'
-          assert old_mk in t, 'Строка COMMON не найдена в Makefile'
-          mk.write_text(t.replace(old_mk, new_mk, 1))
-
-          br = Path('games/totk/android/build_release.py')
-          t = br.read_text()
-          old_br = "'GPU=vk', f'DEV_BUILD={0 if release else 1}'"
-          new_br = "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'"
-          assert old_br in t, 'Строка make не найдена в build_release.py'
-          br.write_text(t.replace(old_br, new_br, 1))
-          print('Патчи Makefile и build_release.py успешно применены')
-          PY
-
-      - name: Сборка APK через build_release.py
+      - name: Сборка APK с автооткатом флагов компиляции
         env:
           APK_KEY_PASS: totk-build-pass-1234
         run: |
-          python3 games/totk/android/build_release.py \
-            --ndk "$ANDROID_HOME/ndk/28.2.13676358" \
-            --turnip /tmp/turnip_driver.so \
-            --key /tmp/release.p12 \
-            --key-pass-env APK_KEY_PASS \
-            -o /tmp/totk-native.apk || {
-              echo "=== ПОСЛЕДНИЕ СТРОКИ ЛОГОВ ==="
-              tail -n 40 games/totk/build/release/logs/*.log 2>/dev/null || true
+          python3 - <<'PY'
+          from pathlib import Path
+          mk = Path('games/totk/android/Makefile')
+          mk.write_text(mk.read_text().replace(
+              'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)',
+              'COMMON := $(PREFIX_MAP) -O3 -g $(PICFLAG)', 1))
+          br = Path('games/totk/android/build_release.py')
+          br.write_text(br.read_text().replace(
+              "'GPU=vk', f'DEV_BUILD={0 if release else 1}'",
+              "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'", 1))
+          PY
+
+          run_build() {
+            python3 games/totk/android/build_release.py \
+              --ndk "$ANDROID_HOME/ndk/28.2.13676358" \
+              --turnip /tmp/turnip_driver.so \
+              --key /tmp/release.p12 \
+              --key-pass-env APK_KEY_PASS \
+              -o /tmp/totk-native.apk
+          }
+
+          show_errors() {
+            echo "=== ТОЧНЫЕ ОШИБКИ ИЗ ЛОГОВ ==="
+            grep -n -C 2 -E "error:|undefined symbol|ld\.lld:|Stop\." games/totk/build/release/logs/*.log 2>/dev/null | tail -n 60 || true
+          }
+
+          if ! run_build; then
+            echo ">>> Сборка с ThinLTO не прошла, переключаюсь на -O3 без LTO..."
+            show_errors
+            git checkout -- games/totk/android/build_release.py
+            rm -rf games/totk/build/release/native-release
+            if ! run_build; then
+              echo ">>> Сборка с -O3 без LTO тоже не прошла:"
+              show_errors
               exit 1
-            }
+            fi
+          fi
+
           mkdir -p out
           cp /tmp/totk-native.apk out/totk-native.apk
 
