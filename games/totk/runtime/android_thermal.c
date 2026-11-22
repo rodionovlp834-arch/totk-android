@@ -22,7 +22,7 @@ static totk_thermal_policy policy;
 static unsigned frames, transitions;
 static uint64_t mono_ns(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
-    return (uint64_t)t.tv_sec * 1000000000 + t.tv_nsec;
+    return (uint64_t)t.tv_sec * 1000000000 + (uint64_t)t.tv_nsec;
 }
 static void *sample_thread(void *unused) {
     (void)unused;
@@ -57,7 +57,7 @@ static void *sample_thread(void *unused) {
 }
 static void configure(void) {
     const char *e = getenv("TOTK_THERMAL_STEP");
-    launch = e && !strcmp(e, "1");
+    launch = !e || strcmp(e, "0") != 0;
     fprintf(stderr, "[totk-thermal] TOTK_THERMAL_STEP=%d (startup-only); guest-floor=%s; severe or headroom>=1.0; recovery 30s below moderate and headroom<0.8\n",
         launch, guest_floor ? "available" : "unavailable (requires v143 FPS60)");
     if (!launch) return;
