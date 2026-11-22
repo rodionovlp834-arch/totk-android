@@ -82,9 +82,9 @@ jobs:
             -inkey /tmp/key.pem -in /tmp/cert.pem \
             -name totk -passout env:APK_KEY_PASS
 
-      - name: Восстановление стокового поведения и применение только -O3 + ThinLTO
+      - name: Применение финальной конфигурации (60Hz lock + сток ADPF/Thermal + -O3/ThinLTO)
         run: |
-          # 1. Стоковый android_perf.c (без ADPF-буста и без сброса герцовки до 30 Гц)
+          # 1. Стоковый android_perf.c (без ADPF-буста и без 30Hz rate-hint)
           for c in $(git log --format=%H -- games/totk/runtime/android_perf.c); do
             if ! git show "$c:games/totk/runtime/android_perf.c" | grep -q 'is_not_zero' \
                && git show "$c:games/totk/runtime/android_perf.c" | tail -n 5 | grep -q '^#endif'; then
@@ -94,7 +94,7 @@ jobs:
             fi
           done
 
-          # 2. Стоковый android_thermal.c (убираем принудительный сброс на 30 FPS на 30 сек)
+          # 2. Стоковый android_thermal.c (без 30-секундных сбросов на 30 FPS)
           for c in $(git log --format=%H -- games/totk/runtime/android_thermal.c); do
             if git show "$c:games/totk/runtime/android_thermal.c" | grep -q 'launch = e && !strcmp(e, "1");'; then
               git show "$c:games/totk/runtime/android_thermal.c" > games/totk/runtime/android_thermal.c
@@ -103,11 +103,11 @@ jobs:
             fi
           done
 
-          # 3. Стоковый TotkActivity.java + только FLAG_KEEP_SCREEN_ON
+          # 3. Чистый TotkActivity.java из истории
           for c in $(git log --format=%H -- games/totk/android/java/com/aure/totk/TotkActivity.java); do
             if ! git show "$c:games/totk/android/java/com/aure/totk/TotkActivity.java" | grep -q 'keep120HzDisplay'; then
               git show "$c:games/totk/android/java/com/aure/totk/TotkActivity.java" > games/totk/android/java/com/aure/totk/TotkActivity.java
-              echo "Восстановлен стоковый TotkActivity.java из $c"
+              echo "Восстановлен чистый TotkActivity.java из $c"
               break
             fi
           done
@@ -115,16 +115,48 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
+          # Жёсткий замок окна на 60 Гц (убирает просадки от касаний LTPO) + запрет сна экрана
           ja = Path('games/totk/android/java/com/aure/totk/TotkActivity.java')
           jt = ja.read_text()
           if jt.startswith('Package '):
               jt = 'package ' + jt[8:]
           if 'WindowManager' not in jt:
               jt = jt.replace('import android.view.View;', 'import android.view.View;\nimport android.view.WindowManager;', 1)
-          if 'FLAG_KEEP_SCREEN_ON' not in jt:
-              jt = jt.replace('super.onCreate(state);', 'super.onCreate(state);\n        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);', 1)
+
+          lock_method = """
+    private void lock60HzDisplay() {
+        getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        Display display = getDisplay();
+        if (display == null) return;
+        Display.Mode current = display.getMode();
+        if (current == null) return;
+        Display.Mode target = current;
+        float bestDiff = Math.abs(current.getRefreshRate() - 60.0f);
+        for (Display.Mode m : display.getSupportedModes()) {
+            if (m.getPhysicalWidth() == current.getPhysicalWidth()
+                    && m.getPhysicalHeight() == current.getPhysicalHeight()) {
+                float diff = Math.abs(m.getRefreshRate() - 60.0f);
+                if (diff < bestDiff) {
+                    bestDiff = diff;
+                    target = m;
+                }
+            }
+        }
+        WindowManager.LayoutParams lp = getWindow().getAttributes();
+        if (lp.preferredDisplayModeId != target.getModeId() || lp.preferredRefreshRate != target.getRefreshRate()) {
+            lp.preferredDisplayModeId = target.getModeId();
+            lp.preferredRefreshRate = target.getRefreshRate();
+            getWindow().setAttributes(lp);
+        }
+    }
+"""
+          jt = jt.replace('@Override protected void onCreate(Bundle state) {', lock_method + '\n    @Override protected void onCreate(Bundle state) {', 1)
+          jt = jt.replace('super.onCreate(state);', 'super.onCreate(state);\n        lock60HzDisplay();', 1)
+          jt = jt.replace('resumed = true;', 'resumed = true;\n        lock60HzDisplay();', 1)
+          jt = jt.replace('super.onWindowFocusChanged(focused);', 'super.onWindowFocusChanged(focused);\n        if (focused) lock60HzDisplay();', 1)
           ja.write_text(jt)
 
+          # Оптимизация компилятора (-O3 + ThinLTO)
           mk = Path('games/totk/android/Makefile')
           mk.write_text(mk.read_text().replace(
               'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)',
@@ -133,7 +165,7 @@ jobs:
           br.write_text(br.read_text().replace(
               "'GPU=vk', f'DEV_BUILD={0 if release else 1}'",
               "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'", 1))
-          print('Чистая сборка с -O3 + ThinLTO готова')
+          print('Финальная конфигурация (60Hz lock + -O3/ThinLTO) успешно применена')
           PY
 
       - name: Сборка APK
