@@ -62,6 +62,7 @@ static struct { unsigned frames, spans, gpus, errors, hints, hint_errors; uint64
 /* Bounded registry; pthread CPU clocks avoid /proc parsing/allocations. */
 static struct { int32_t tid; clockid_t clock; uint64_t cpu, used; int critical; } registry[256];
 static int is_one(const char *name) { const char *s = getenv(name); return s && !strcmp(s, "1"); }
+static int is_not_zero(const char *name) { const char *s = getenv(name); return !s || strcmp(s, "0") != 0; }
 static uint64_t mono_ns(void) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
     return (uint64_t)t.tv_sec * 1000000000 + (uint64_t)t.tv_nsec;
@@ -96,7 +97,7 @@ static void log_refinements(void) {
 }
 static void configure(void) {
     const char *request = getenv("TOTK_ADPF"), *target = getenv("TOTK_ADPF_TARGET_MS");
-    mode = request && !strcmp(request, "0") ? 0 : request && !strcmp(request, "full") ? 2 : 1;
+        mode = request && !strcmp(request, "0") ? 0 : (request && (!strcmp(request, "1") || !strcmp(request, "legacy"))) ? 1 : 2;
     double ms = target && *target ? atof(target) : 33.3;
     legacy_target = ms > 0 && ms < 1000 ? (int64_t)(ms * 1e6) : 0;
     if (mode == 1 && !legacy_target) mode = 0;
