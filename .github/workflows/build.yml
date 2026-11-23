@@ -1,19 +1,26 @@
-name: Build TotK Native APK (30 FPS)
+name: Build TotK Native APK (Oryon 30 FPS)
 
 on:
   workflow_dispatch:
     inputs:
       adpf_mode:
-        description: 'ADPF: full = все игровые потоки в сессии, legacy = как в стоке'
+        description: 'Режим ADPF (full — все потоки кадра + GPU/LoadHint; legacy — 1 поток)'
         type: choice
+        default: 'full'
         options:
-          - full
-          - legacy
-        default: full
-      adpf_target_ms:
-        description: 'Цель ADPF, мс. Меньше = больше запас по кадру, но горячее. 33.3 = сток'
+          - 'full'
+          - 'legacy'
+      adpf_target_pct:
+        description: 'Целевой % периода 33.3 мс (50..100; 58 = 19.3 мс, 55 = 18.3 мс, 65 = 21.7 мс)'
         type: string
-        default: '24.0'
+        default: '58'
+      display_hz:
+        description: 'Замок частоты экрана окна (60 для 30 FPS, 120 для 40/60 FPS)'
+        type: choice
+        default: '60'
+        options:
+          - '60'
+          - '120'
 
 jobs:
   build:
@@ -41,7 +48,7 @@ jobs:
         with:
           dotnet-version: '10.0.x'
 
-      - name: Фиксация .NET 10 SDK (вместо 11.0.100)
+      - name: Фиксация .NET 10 SDK (вместо 11.0.x)
         run: |
           SDK10=$(dotnet --list-sdks | awk '/^10\./ {print $1}' | sort -V | tail -n 1)
           if [ -z "$SDK10" ]; then
@@ -49,7 +56,7 @@ jobs:
             dotnet --list-sdks
             exit 1
           fi
-          printf '{\n  "sdk": {\n    "version": "%s",\n    "rollForward": "latestPatch"\n  }\n}\n' "$SDK10" > ../global.json
+          printf '{\n  "sdk": {\n    "version": "%s",\n    "rollForward": "latestPatch"\n  }\n}\n' "$SDK10" > global.json
           for d in $(dotnet --list-sdks | awk '/^11\./ {gsub(/[\[\]]/, "", $2); print $2 "/" $1}'); do
             sudo rm -rf "$d"
           done
@@ -59,7 +66,7 @@ jobs:
         run: |
           pip install cryptography==50.0.2
           sudo apt-get update -qq
-          sudo apt-get install -y -qq cmake ninja-build nasm yasm pkg-config autoconf automake libtool unzip clang lld zlib1g-dev
+          sudo apt-get install -y -qq cmake ninja-build nasm yasm pkg-config autoconf automake libtool unzip
 
       - name: Установка Android NDK r28 и SDK
         run: |
@@ -71,11 +78,23 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
 
+      - name: Определение флагов компилятора под Oryon (SM8750)
+        run: |
+          CLANG="$ANDROID_HOME/ndk/28.2.13676358/toolchains/llvm/prebuilt/linux-x86_64/bin/clang"
+          if echo 'int main(void){return 0;}' | "$CLANG" --target=aarch64-linux-android33 -x c - -c -o /tmp/oryon_test.o -mcpu=oryon-1 2>/dev/null; then
+            ORYON_FLAGS="-mcpu=oryon-1"
+          else
+            ORYON_FLAGS="-march=armv8.4-a+crc+crypto+fp16+dotprod"
+          fi
+          rm -f /tmp/oryon_test.o
+          echo "ORYON_FLAGS=$ORYON_FLAGS" >> "$GITHUB_ENV"
+          echo "Флаги Oryon: $ORYON_FLAGS"
+
       - name: Извлечение драйвера Turnip из релиза v1.0.1
         run: |
           curl -fL "https://github.com/AurelioB/totk-android/releases/download/v1.0.1/TotK-Native-1.0.1.apk" -o /tmp/ref.apk
           unzip -q /tmp/ref.apk -d /tmp/ref_apk
-          TURNIP_PATH=$(find /tmp/ref_apk -type f -exec sha256sum {} + | awk '$1=="9b87afeb3d8d30c6a0ad5aab3e0703bc1500e0321e9f17a922106fa556389ec6" {sub(/^[^ ]+ +/, ""); print; exit}')
+          TURNIP_PATH=$(find /tmp/ref_apk -type f -exec sha256sum {} + | awk '$1 ~ /^9b87afeb3d8d30c6a0ad5aa/ {print $2; exit}')
           if [ -z "$TURNIP_PATH" ]; then
             echo "ОШИБКА: драйвер Turnip с нужным SHA-256 не найден"
             exit 1
@@ -94,33 +113,40 @@ jobs:
             -inkey /tmp/key.pem -in /tmp/cert.pem \
             -name totk -passout env:APK_KEY_PASS
 
-      - name: Применение конфигурации (60Hz lock + ADPF под 30 FPS + -O3/ThinLTO)
+      - name: Применение патчей Oryon + ADPF + Display Lock
         env:
           ADPF_MODE: ${{ inputs.adpf_mode }}
-          ADPF_TARGET_MS: ${{ inputs.adpf_target_ms }}
+          ADPF_TARGET_PCT: ${{ inputs.adpf_target_pct }}
+          DISPLAY_HZ: ${{ inputs.display_hz }}
         run: |
-          # 1. Стоковый android_perf.c
+          # 1. Восстановление чистого android_perf.c (обходим обрезанный файл в форке)
+          RESTORED_PERF=0
           for c in $(git log --format=%H -- games/totk/runtime/android_perf.c); do
             if ! git show "$c:games/totk/runtime/android_perf.c" | grep -q 'is_not_zero' \
                && git show "$c:games/totk/runtime/android_perf.c" | tail -n 5 | grep -q '^#endif'; then
               git show "$c:games/totk/runtime/android_perf.c" > games/totk/runtime/android_perf.c
-              echo "Восстановлен стоковый android_perf.c из $c"
+              echo "Восстановлен чистый android_perf.c из $c"
+              RESTORED_PERF=1
               break
             fi
           done
+          if [ "$RESTORED_PERF" -ne 1 ]; then
+            echo "ОШИБКА: не найден чистый android_perf.c в git-истории"
+            exit 1
+          fi
 
-          # 2. Стоковый android_thermal.c
+          # 2. Восстановление стокового android_thermal.c
           for c in $(git log --format=%H -- games/totk/runtime/android_thermal.c); do
-            if git show "$c:games/totk/runtime/android_thermal.c" | grep -q 'launch = e && !strcmp(e, "1");'; then
+            if git show "$c:games/totk/runtime/android_thermal.c" | grep -q '!strcmp(e, "1")'; then
               git show "$c:games/totk/runtime/android_thermal.c" > games/totk/runtime/android_thermal.c
-              echo "Восстановлен стоковый android_thermal.c из $c"
+              echo "Восстановлен чистый android_thermal.c из $c"
               break
             fi
           done
 
-          # 3. Чистый TotkActivity.java из истории
+          # 3. Восстановление чистого TotkActivity.java
           for c in $(git log --format=%H -- games/totk/android/java/com/aure/totk/TotkActivity.java); do
-            if ! git show "$c:games/totk/android/java/com/aure/totk/TotkActivity.java" | grep -q 'keep120HzDisplay'; then
+            if ! git show "$c:games/totk/android/java/com/aure/totk/TotkActivity.java" | grep -Eq 'keep120Hz|lock120HzDisplay|lock60HzDisplay|lockDisplayHz'; then
               git show "$c:games/totk/android/java/com/aure/totk/TotkActivity.java" > games/totk/android/java/com/aure/totk/TotkActivity.java
               echo "Восстановлен чистый TotkActivity.java из $c"
               break
@@ -128,127 +154,181 @@ jobs:
           done
 
           python3 - <<'PY'
-          import os
+          import os, re
           from pathlib import Path
 
-          summary = []
+          adpf_mode = os.environ['ADPF_MODE'].strip()
+          pct = int(os.environ['ADPF_TARGET_PCT'].strip())
+          assert 50 <= pct <= 100, f'ADPF_TARGET_PCT должен быть 50..100, получено {pct}'
+          display_hz = int(os.environ['DISPLAY_HZ'].strip())
+          oryon_flags = os.environ['ORYON_FLAGS'].strip()
+          target_ms_30 = round(33.333333 * pct / 100.0, 2)
 
-          def note(msg):
-              print(msg)
-              summary.append(msg)
-
-          mode_req = os.environ.get('ADPF_MODE', 'full').strip()
-          target_ms = float(os.environ.get('ADPF_TARGET_MS', '24.0').strip().replace(',', '.'))
-          assert mode_req in ('full', 'legacy'), 'adpf_mode должен быть full или legacy'
-          assert 10.0 <= target_ms <= 34.0, 'adpf_target_ms должен быть в диапазоне 10..34'
-
-          # 1. android_perf.c: режим ADPF и цель длительности кадра под 30 FPS
+          # --- 1. android_perf.c ---
           pf = Path('games/totk/runtime/android_perf.c')
           pt = pf.read_text()
 
-          if mode_req == 'full':
-              old_mode = 'mode = request && !strcmp(request, "0") ? 0 : request && !strcmp(request, "full") ? 2 : 1;'
-              new_mode = 'mode = request && !strcmp(request, "0") ? 0 : (request && (!strcmp(request, "1") || !strcmp(request, "legacy"))) ? 1 : 2;'
-              assert old_mode in pt, 'Строка mode не найдена в android_perf.c'
-              pt = pt.replace(old_mode, new_mode, 1)
-              note('ADPF режим: full (все игровые потоки в сессии) - ПРИМЕНЕНО')
-          else:
-              note('ADPF режим: legacy (сток) - без изменений')
+          # Добавляем is_not_zero
+          is_one_def = 'static int is_one(const char *name) { const char *s = getenv(name); return s && !strcmp(s, "1"); }'
+          assert is_one_def in pt, 'Не найден is_one в android_perf.c'
+          pt = pt.replace(
+              is_one_def,
+              is_one_def + '\nstatic int is_not_zero(const char *name) { const char *s = getenv(name); return !s || strcmp(s, "0") != 0; }',
+              1,
+          )
 
+          # Процент целевого времени кадра для TOTK_ADPF_GPU (работает в API 35/36)
+          old_pct_decl = 'static int target_pct_launch = 90, target_pct_applied = 90;'
+          assert old_pct_decl in pt, 'Не найден target_pct_launch в android_perf.c'
+          pt = pt.replace(old_pct_decl, f'static int target_pct_launch = {pct}, target_pct_applied = {pct};', 1)
+          assert 'target_pct_launch = 90;' in pt, 'Не найден fallback target_pct_launch = 90'
+          pt = pt.replace('target_pct_launch = 90;', f'target_pct_launch = {pct};', 1)
+
+          # Режим ADPF (full по умолчанию)
+          old_mode = 'mode = request && !strcmp(request, "0") ? 0 : request && !strcmp(request, "full") ? 2 : 1;'
+          assert old_mode in pt, 'Не найдена строка mode в android_perf.c'
+          if adpf_mode == 'full':
+              new_mode = 'mode = request && !strcmp(request, "0") ? 0 : (request && (!strcmp(request, "1") || !strcmp(request, "legacy"))) ? 1 : 2;'
+              pt = pt.replace(old_mode, new_mode, 1)
+
+          # legacy_target (на случай legacy или отключения TOTK_ADPF_GPU)
           old_ms = 'double ms = target && *target ? atof(target) : 33.3;'
-          new_ms = 'double ms = target && *target ? atof(target) : %.1f;' % target_ms
-          if old_ms in pt:
-              pt = pt.replace(old_ms, new_ms, 1)
-              note('Цель ADPF: %.1f мс - ПРИМЕНЕНО' % target_ms)
-          else:
-              note('ВНИМАНИЕ: строка с целью 33.3 мс не найдена в android_perf.c - цель осталась стоковой')
+          assert old_ms in pt, 'Не найдена строка target 33.3 в android_perf.c'
+          pt = pt.replace(old_ms, f'double ms = target && *target ? atof(target) : {target_ms_30:.2f};', 1)
+
+          # Включаем по умолчанию GPU span, API 36 workload increase hint и CPU split (отключаются через =0)
+          for var in ('TOTK_ADPF_GPU', 'TOTK_ADPF_LOAD_HINT', 'TOTK_ADPF_CPU_SPLIT'):
+              old_v = f'is_one("{var}")'
+              assert old_v in pt, f'Не найден {old_v} в android_perf.c'
+              pt = pt.replace(old_v, f'is_not_zero("{var}")', 1)
+
+          # Регистрируем totk-walk как критический поток ADPF
+          old_crit = '!strcmp(name, "totk-translate") || !strcmp(name, "g-main");'
+          assert old_crit in pt, 'Не найден список critical-потоков в android_perf.c'
+          pt = pt.replace(
+              old_crit,
+              '!strcmp(name, "totk-translate") || !strcmp(name, "totk-walk") || !strcmp(name, "g-main");',
+              1,
+          )
+
+          # Снижаем порог захвата активных g-* воркеров в ADPF с 15% до 8%
+          old_thresh = 'registry[i].used >= elapsed * 15 / 100'
+          assert old_thresh in pt, 'Не найден порог 15% в android_perf.c'
+          pt = pt.replace(old_thresh, 'registry[i].used >= elapsed * 8 / 100', 1)
 
           pf.write_text(pt)
 
-          # 2. TotkActivity.java: жёсткий замок окна на 60 Гц + запрет сна экрана
+          # --- 2. thread_place.h ---
+          tf = Path('games/totk/runtime/thread_place.h')
+          tt = tf.read_text()
+
+          # Передаём totk-walk в totk_perf_thread
+          tt_new, n_walk = re.subn(
+              r'(!strcmp\(name,\s*"totk-present"\))',
+              r'\1 || !strcmp(name, "totk-walk")',
+              tt,
+              count=1,
+          )
+          assert n_walk == 1, 'Не найдена регистрация totk-present в thread_place.h'
+          tt = tt_new
+
+          # Ставим TOTK_TIMER_SLACK_NS=1 по умолчанию (можно выключить через TOTK_TIMER_SLACK_NS=0)
+          tt_new, n_slack = re.subn(
+              r'(const\s+char\s*\*value\s*=\s*getenv\("TOTK_TIMER_SLACK_NS"\);\s*)if\s*\(!value\)\s*return;',
+              r'\1if (!value) value = "1";\n    if (!strcmp(value, "0")) return;',
+              tt,
+              count=1,
+          )
+          assert n_slack == 1, 'Не найден TOTK_TIMER_SLACK_NS в thread_place.h'
+          tt = tt_new
+
+          tf.write_text(tt)
+
+          # --- 3. Settings.java ---
+          sf = Path('games/totk/android/java/com/aure/totk/setup/Settings.java')
+          st = sf.read_text()
+
+          st_new, n_gpu = re.subn(
+              r'if\s*\(sixty\)\s*line\(out,\s*"TOTK_GPU_TIME=hardware"\);',
+              'if (sixty || fps60Hysteresis || "on".equals(get("gpu_feed"))) line(out, "TOTK_GPU_TIME=hardware");\n'
+              '            if (fps60Hysteresis) { line(out, "TOTK_PRIO_RENDER=-4"); line(out, "TOTK_PRIO_WALK=-8"); }',
+              st,
+              count=1,
+          )
+          assert n_gpu == 1, 'Не найдена строка TOTK_GPU_TIME=hardware в Settings.java'
+          sf.write_text(st_new)
+
+          # --- 4. TotkActivity.java (замок окна на 60/120 Гц + FLAG_KEEP_SCREEN_ON) ---
           ja = Path('games/totk/android/java/com/aure/totk/TotkActivity.java')
           jt = ja.read_text()
           if jt.startswith('Package '):
               jt = 'package ' + jt[8:]
-          if 'WindowManager' not in jt:
-              jt = jt.replace('import android.view.View;', 'import android.view.View;\nimport android.view.WindowManager;', 1)
+          for imp in ('import android.view.Display;', 'import android.view.WindowManager;'):
+              if imp not in jt:
+                  assert 'import android.view.View;' in jt, 'Не найден import android.view.View в TotkActivity.java'
+                  jt = jt.replace('import android.view.View;', f'import android.view.View;\n{imp}', 1)
 
-          lock_method = """
-              private void lock60HzDisplay() {
+          lock_method = f"""
+              private void lockDisplayHz() {{
                   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                   Display display = getDisplay();
                   if (display == null) return;
                   Display.Mode current = display.getMode();
                   if (current == null) return;
                   Display.Mode target = current;
-                  float bestDiff = Math.abs(current.getRefreshRate() - 60.0f);
-                  for (Display.Mode m : display.getSupportedModes()) {
+                  float wantHz = {display_hz}.0f;
+                  float bestDiff = Math.abs(current.getRefreshRate() - wantHz);
+                  for (Display.Mode m : display.getSupportedModes()) {{
                       if (m.getPhysicalWidth() == current.getPhysicalWidth()
-                              && m.getPhysicalHeight() == current.getPhysicalHeight()) {
-                          float diff = Math.abs(m.getRefreshRate() - 60.0f);
-                          if (diff < bestDiff) {
+                              && m.getPhysicalHeight() == current.getPhysicalHeight()) {{
+                          float diff = Math.abs(m.getRefreshRate() - wantHz);
+                          if (diff < bestDiff) {{
                               bestDiff = diff;
                               target = m;
-                          }
-                      }
-                  }
+                          }}
+                      }}
+                  }}
                   WindowManager.LayoutParams lp = getWindow().getAttributes();
-                  if (lp.preferredDisplayModeId != target.getModeId() || lp.preferredRefreshRate != target.getRefreshRate()) {
+                  if (lp.preferredDisplayModeId != target.getModeId()
+                          || lp.preferredRefreshRate != target.getRefreshRate()) {{
                       lp.preferredDisplayModeId = target.getModeId();
                       lp.preferredRefreshRate = target.getRefreshRate();
                       getWindow().setAttributes(lp);
-                  }
-              }
+                  }}
+              }}
           """
+          assert '@Override protected void onCreate(Bundle state) {' in jt, 'Не найден onCreate в TotkActivity.java'
           jt = jt.replace('@Override protected void onCreate(Bundle state) {', lock_method + '\n    @Override protected void onCreate(Bundle state) {', 1)
-          jt = jt.replace('super.onCreate(state);', 'super.onCreate(state);\n        lock60HzDisplay();', 1)
-          jt = jt.replace('resumed = true;', 'resumed = true;\n        lock60HzDisplay();', 1)
-          jt = jt.replace('super.onWindowFocusChanged(focused);', 'super.onWindowFocusChanged(focused);\n        if (focused) lock60HzDisplay();', 1)
+          jt = jt.replace('super.onCreate(state);', 'super.onCreate(state);\n        lockDisplayHz();', 1)
+          jt = jt.replace('resumed = true;', 'resumed = true;\n        lockDisplayHz();', 1)
+          jt = jt.replace('super.onWindowFocusChanged(focused);', 'super.onWindowFocusChanged(focused);\n        if (focused) lockDisplayHz();', 1)
           ja.write_text(jt)
-          note('Замок окна на 60 Гц (lock60HzDisplay) - ПРИМЕНЁН')
 
-          # 3. Оптимизация компилятора (-O3 + ThinLTO)
+          # --- 5. Makefile (-O3 + Oryon) и build_release.py (ThinLTO) ---
           mk = Path('games/totk/android/Makefile')
-          mt = mk.read_text()
-          old_o2 = 'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)'
-          if old_o2 in mt:
-              mk.write_text(mt.replace(old_o2, 'COMMON := $(PREFIX_MAP) -O3 -g $(PICFLAG)', 1))
-              note('Компилятор: -O3 - ПРИМЕНЕНО')
-          else:
-              note('ВНИМАНИЕ: строка COMMON с -O2 не найдена в Makefile')
+          mkt = mk.read_text()
+          old_common = 'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)'
+          assert old_common in mkt, 'Не найдена строка COMMON в games/totk/android/Makefile'
+          mk.write_text(mkt.replace(old_common, f'COMMON := $(PREFIX_MAP) -O3 {oryon_flags} -g $(PICFLAG)', 1))
+
           br = Path('games/totk/android/build_release.py')
-          bt = br.read_text()
-          old_gpu = "'GPU=vk', f'DEV_BUILD={0 if release else 1}'"
-          if old_gpu in bt:
-              br.write_text(bt.replace(old_gpu, "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'", 1))
-              note('Компилятор: ThinLTO - ПРИМЕНЕНО')
-          else:
-              note('ВНИМАНИЕ: строка GPU=vk не найдена в build_release.py')
+          brt = br.read_text()
+          old_br = "'GPU=vk', f'DEV_BUILD={0 if release else 1}'"
+          assert old_br in brt, 'Не найдена строка GPU=vk в build_release.py'
+          br.write_text(brt.replace(old_br, "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'", 1))
 
-          sp = os.environ.get('GITHUB_STEP_SUMMARY')
-          if sp:
-              with open(sp, 'a', encoding='utf-8') as f:
-                  f.write('### Применённая конфигурация\n')
-                  for s in summary:
-                      f.write('- ' + s + '\n')
+          summary = Path(os.environ['GITHUB_STEP_SUMMARY'])
+          summary.write_text(
+              f"### Применённый патч (Oryon / SM8750)\n"
+              f"- **ADPF режим:** `{adpf_mode}` + `TOTK_ADPF_GPU=1` + `TOTK_ADPF_CPU_SPLIT=1` + `TOTK_ADPF_LOAD_HINT=1`\n"
+              f"- **Цель ADPF (30 FPS):** `{pct}%` = **{target_ms_30:.2f} мс** (ранний буст при > {target_ms_30 * 1.05:.2f} мс)\n"
+              f"- **Потоки ADPF:** добавлен `totk-walk` в critical, порог воркеров `g-*` снижен `15% -> 8%`\n"
+              f"- **Планировщик:** `TOTK_TIMER_SLACK_NS=1` по умолчанию; для SM8750 включены `TOTK_GPU_TIME=hardware`, `TOTK_PRIO_RENDER=-4`, `TOTK_PRIO_WALK=-8`\n"
+              f"- **Экран:** жёсткий замок окна `lockDisplayHz({display_hz} Гц)` + `FLAG_KEEP_SCREEN_ON`\n"
+              f"- **Компилятор:** `-O3 {oryon_flags}` + `LTO=thin`\n"
+          )
+          print('Все патчи успешно применены!')
           PY
-
-          # Справка для следующей настройки: какие переменные читает порт и где задаются
-          {
-            echo '### Переменные TOTK_/DM_, которые читает порт'
-            echo '```'
-            grep -rhoE '(getenv|is_one|nonzero|differs|option)\("(TOTK|DM)_[A-Z0-9_]+"' games/totk --include='*.c' --include='*.h' --include='*.cpp' 2>/dev/null | sed -E 's/^[^"]*"//; s/"$//' | sort -u | tr '\n' ' ' || true
-            echo
-            echo '```'
-            echo '### android_perf.c: режим и цель ADPF'
-            echo '```'
-            grep -nE 'getenv|mode =|double ms' games/totk/runtime/android_perf.c | head -n 40 || true
-            echo '```'
-            echo '### Где задаются параметры темпа кадров'
-            echo '```'
-            grep -rn -E 'TOTK_PRESENT_SLOTS|DM_PRESENT_(HZ|INTERVAL)|TOTK_REALTIME' games/totk --include='*.java' --include='*.py' --include='*.sh' --include='*.env' --include='*.json' 2>/dev/null | head -n 40 || true
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Сборка APK
         env:
@@ -262,29 +342,26 @@ jobs:
               --key-pass-env APK_KEY_PASS \
               -o /tmp/totk-native.apk
           }
-
           show_errors() {
             echo "=== ТОЧНЫЕ ОШИБКИ ИЗ ЛОГОВ ==="
-            grep -n -C 2 -E "error:|undefined symbol|ld\.lld:|Stop\." games/totk/build/release/logs/*.log 2>/dev/null | tail -n 60 || true
+            grep -n -C 2 -E "error:|undefined symbol|ld\.lld:|Stop\." games/totk/build/release/logs/*.log || true
           }
-
           if ! run_build; then
-            echo ">>> Сборка с ThinLTO не прошла, переключаюсь на -O3 без LTO..."
+            echo ">>> Сборка с ThinLTO не прошла, откатываю только LTO (оставляя -O3 + $ORYON_FLAGS)..."
             show_errors
             git checkout -- games/totk/android/build_release.py
             rm -rf games/totk/build/release/native-release
             if ! run_build; then
-              echo ">>> Сборка с -O3 без LTO тоже не прошла:"
+              echo ">>> Сборка без ThinLTO тоже не прошла:"
               show_errors
               exit 1
             fi
           fi
-
           mkdir -p out
           cp /tmp/totk-native.apk out/totk-native.apk
 
       - name: Выгрузка готового APK
         uses: actions/upload-artifact@v4
         with:
-          name: TotK-Native-30fps-${{ inputs.adpf_mode }}-${{ inputs.adpf_target_ms }}
+          name: TotK-Native-Oryon-${{ inputs.adpf_mode }}-pct${{ inputs.adpf_target_pct }}-${{ inputs.display_hz }}hz
           path: out/totk-native.apk
