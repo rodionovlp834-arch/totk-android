@@ -1,7 +1,19 @@
-name: Build TotK Native APK
+name: Build TotK Native APK (30 FPS)
 
 on:
   workflow_dispatch:
+    inputs:
+      adpf_mode:
+        description: 'ADPF: full = все игровые потоки в сессии, legacy = как в стоке'
+        type: choice
+        options:
+          - full
+          - legacy
+        default: full
+      adpf_target_ms:
+        description: 'Цель ADPF, мс. Меньше = больше запас по кадру, но горячее. 33.3 = сток'
+        type: string
+        default: '24.0'
 
 jobs:
   build:
@@ -82,7 +94,10 @@ jobs:
             -inkey /tmp/key.pem -in /tmp/cert.pem \
             -name totk -passout env:APK_KEY_PASS
 
-      - name: Применение конфигурации (60Hz lock + ADPF full 26.0ms для стабильных 30 FPS + -O3/ThinLTO)
+      - name: Применение конфигурации (60Hz lock + ADPF под 30 FPS + -O3/ThinLTO)
+        env:
+          ADPF_MODE: ${{ inputs.adpf_mode }}
+          ADPF_TARGET_MS: ${{ inputs.adpf_target_ms }}
         run: |
           # 1. Стоковый android_perf.c
           for c in $(git log --format=%H -- games/totk/runtime/android_perf.c); do
@@ -94,7 +109,7 @@ jobs:
             fi
           done
 
-          # 2. Стоковый android_thermal.c (без принудительных сбросов)
+          # 2. Стоковый android_thermal.c
           for c in $(git log --format=%H -- games/totk/runtime/android_thermal.c); do
             if git show "$c:games/totk/runtime/android_thermal.c" | grep -q 'launch = e && !strcmp(e, "1");'; then
               git show "$c:games/totk/runtime/android_thermal.c" > games/totk/runtime/android_thermal.c
@@ -113,25 +128,44 @@ jobs:
           done
 
           python3 - <<'PY'
+          import os
           from pathlib import Path
 
-          # 1. android_perf.c: ADPF full по всем игровым потокам + цель 26.0ms (запас 7.3ms до лимита 33.3ms для 30 FPS)
+          summary = []
+
+          def note(msg):
+              print(msg)
+              summary.append(msg)
+
+          mode_req = os.environ.get('ADPF_MODE', 'full').strip()
+          target_ms = float(os.environ.get('ADPF_TARGET_MS', '24.0').strip().replace(',', '.'))
+          assert mode_req in ('full', 'legacy'), 'adpf_mode должен быть full или legacy'
+          assert 10.0 <= target_ms <= 34.0, 'adpf_target_ms должен быть в диапазоне 10..34'
+
+          # 1. android_perf.c: режим ADPF и цель длительности кадра под 30 FPS
           pf = Path('games/totk/runtime/android_perf.c')
           pt = pf.read_text()
 
-          old_mode = 'mode = request && !strcmp(request, "0") ? 0 : request && !strcmp(request, "full") ? 2 : 1;'
-          new_mode = 'mode = request && !strcmp(request, "0") ? 0 : (request && (!strcmp(request, "1") || !strcmp(request, "legacy"))) ? 1 : 2;'
-          assert old_mode in pt, 'Строка mode не найдена в android_perf.c'
-          pt = pt.replace(old_mode, new_mode, 1)
+          if mode_req == 'full':
+              old_mode = 'mode = request && !strcmp(request, "0") ? 0 : request && !strcmp(request, "full") ? 2 : 1;'
+              new_mode = 'mode = request && !strcmp(request, "0") ? 0 : (request && (!strcmp(request, "1") || !strcmp(request, "legacy"))) ? 1 : 2;'
+              assert old_mode in pt, 'Строка mode не найдена в android_perf.c'
+              pt = pt.replace(old_mode, new_mode, 1)
+              note('ADPF режим: full (все игровые потоки в сессии) - ПРИМЕНЕНО')
+          else:
+              note('ADPF режим: legacy (сток) - без изменений')
 
           old_ms = 'double ms = target && *target ? atof(target) : 33.3;'
-          new_ms = 'double ms = target && *target ? atof(target) : (is_one("TOTK_FPS60") ? 15.0 : 26.0);'
-          assert old_ms in pt, 'Строка target 33.3 не найдена в android_perf.c'
-          pt = pt.replace(old_ms, new_ms, 1)
+          new_ms = 'double ms = target && *target ? atof(target) : %.1f;' % target_ms
+          if old_ms in pt:
+              pt = pt.replace(old_ms, new_ms, 1)
+              note('Цель ADPF: %.1f мс - ПРИМЕНЕНО' % target_ms)
+          else:
+              note('ВНИМАНИЕ: строка с целью 33.3 мс не найдена в android_perf.c - цель осталась стоковой')
 
           pf.write_text(pt)
 
-          # 2. TotkActivity.java: жёсткий замок окна на 60 Гц (ровный пейсинг 30 FPS без скачков LTPO от касаний)
+          # 2. TotkActivity.java: жёсткий замок окна на 60 Гц + запрет сна экрана
           ja = Path('games/totk/android/java/com/aure/totk/TotkActivity.java')
           jt = ja.read_text()
           if jt.startswith('Package '):
@@ -171,18 +205,50 @@ jobs:
           jt = jt.replace('resumed = true;', 'resumed = true;\n        lock60HzDisplay();', 1)
           jt = jt.replace('super.onWindowFocusChanged(focused);', 'super.onWindowFocusChanged(focused);\n        if (focused) lock60HzDisplay();', 1)
           ja.write_text(jt)
+          note('Замок окна на 60 Гц (lock60HzDisplay) - ПРИМЕНЁН')
 
           # 3. Оптимизация компилятора (-O3 + ThinLTO)
           mk = Path('games/totk/android/Makefile')
-          mk.write_text(mk.read_text().replace(
-              'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)',
-              'COMMON := $(PREFIX_MAP) -O3 -g $(PICFLAG)', 1))
+          mt = mk.read_text()
+          old_o2 = 'COMMON := $(PREFIX_MAP) -O2 -g $(PICFLAG)'
+          if old_o2 in mt:
+              mk.write_text(mt.replace(old_o2, 'COMMON := $(PREFIX_MAP) -O3 -g $(PICFLAG)', 1))
+              note('Компилятор: -O3 - ПРИМЕНЕНО')
+          else:
+              note('ВНИМАНИЕ: строка COMMON с -O2 не найдена в Makefile')
           br = Path('games/totk/android/build_release.py')
-          br.write_text(br.read_text().replace(
-              "'GPU=vk', f'DEV_BUILD={0 if release else 1}'",
-              "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'", 1))
-          print('Конфигурация (60Hz lock + ADPF full 26.0ms для 30 FPS + -O3/ThinLTO) успешно применена')
+          bt = br.read_text()
+          old_gpu = "'GPU=vk', f'DEV_BUILD={0 if release else 1}'"
+          if old_gpu in bt:
+              br.write_text(bt.replace(old_gpu, "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'", 1))
+              note('Компилятор: ThinLTO - ПРИМЕНЕНО')
+          else:
+              note('ВНИМАНИЕ: строка GPU=vk не найдена в build_release.py')
+
+          sp = os.environ.get('GITHUB_STEP_SUMMARY')
+          if sp:
+              with open(sp, 'a', encoding='utf-8') as f:
+                  f.write('### Применённая конфигурация\n')
+                  for s in summary:
+                      f.write('- ' + s + '\n')
           PY
+
+          # Справка для следующей настройки: какие переменные читает порт и где задаются
+          {
+            echo '### Переменные TOTK_/DM_, которые читает порт'
+            echo '```'
+            grep -rhoE '(getenv|is_one|nonzero|differs|option)\("(TOTK|DM)_[A-Z0-9_]+"' games/totk --include='*.c' --include='*.h' --include='*.cpp' 2>/dev/null | sed -E 's/^[^"]*"//; s/"$//' | sort -u | tr '\n' ' ' || true
+            echo
+            echo '```'
+            echo '### android_perf.c: режим и цель ADPF'
+            echo '```'
+            grep -nE 'getenv|mode =|double ms' games/totk/runtime/android_perf.c | head -n 40 || true
+            echo '```'
+            echo '### Где задаются параметры темпа кадров'
+            echo '```'
+            grep -rn -E 'TOTK_PRESENT_SLOTS|DM_PRESENT_(HZ|INTERVAL)|TOTK_REALTIME' games/totk --include='*.java' --include='*.py' --include='*.sh' --include='*.env' --include='*.json' 2>/dev/null | head -n 40 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Сборка APK
         env:
@@ -220,5 +286,5 @@ jobs:
       - name: Выгрузка готового APK
         uses: actions/upload-artifact@v4
         with:
-          name: TotK-Native-APK
+          name: TotK-Native-30fps-${{ inputs.adpf_mode }}-${{ inputs.adpf_target_ms }}
           path: out/totk-native.apk
