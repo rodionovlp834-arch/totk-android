@@ -82,7 +82,7 @@ jobs:
             -inkey /tmp/key.pem -in /tmp/cert.pem \
             -name totk -passout env:APK_KEY_PASS
 
-      - name: Применение конфигурации (120Hz lock + чистый ADPF full + -O3/ThinLTO)
+      - name: Применение конфигурации (120Hz lock + ADPF full 18.0ms + -O3/ThinLTO)
         run: |
           # 1. Стоковый android_perf.c
           for c in $(git log --format=%H -- games/totk/runtime/android_perf.c); do
@@ -115,7 +115,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          # 1. android_perf.c: чистый ADPF full (все игровые потоки, без LOAD_HINT/GPU и без сброса герцовки)
+          # 1. android_perf.c: ADPF full + цель 18.0ms для 40 FPS (15.0ms для 60 FPS) вшита в код
           pf = Path('games/totk/runtime/android_perf.c')
           pt = pf.read_text()
 
@@ -123,6 +123,11 @@ jobs:
           new_mode = 'mode = request && !strcmp(request, "0") ? 0 : (request && (!strcmp(request, "1") || !strcmp(request, "legacy"))) ? 1 : 2;'
           assert old_mode in pt, 'Строка mode не найдена в android_perf.c'
           pt = pt.replace(old_mode, new_mode, 1)
+
+          old_ms = 'double ms = target && *target ? atof(target) : 33.3;'
+          new_ms = 'double ms = target && *target ? atof(target) : (is_one("TOTK_FPS60") ? 15.0 : 18.0);'
+          assert old_ms in pt, 'Строка target 33.3 не найдена в android_perf.c'
+          pt = pt.replace(old_ms, new_ms, 1)
 
           pf.write_text(pt)
 
@@ -176,7 +181,7 @@ jobs:
           br.write_text(br.read_text().replace(
               "'GPU=vk', f'DEV_BUILD={0 if release else 1}'",
               "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'", 1))
-          print('Конфигурация (120Hz lock + чистый ADPF full + -O3/ThinLTO) успешно применена')
+          print('Конфигурация (120Hz lock + ADPF full 18.0ms + -O3/ThinLTO) успешно применена')
           PY
 
       - name: Сборка APK
