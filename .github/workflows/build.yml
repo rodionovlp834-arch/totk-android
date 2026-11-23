@@ -82,7 +82,7 @@ jobs:
             -inkey /tmp/key.pem -in /tmp/cert.pem \
             -name totk -passout env:APK_KEY_PASS
 
-      - name: Применение оптимизаций (60Hz lock + чистый ADPF full + -O3/ThinLTO)
+      - name: Применение конфигурации (120Hz lock + чистый ADPF full + -O3/ThinLTO)
         run: |
           # 1. Стоковый android_perf.c
           for c in $(git log --format=%H -- games/totk/runtime/android_perf.c); do
@@ -115,7 +115,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
-          # 1. android_perf.c: чистый ADPF full (все игровые потоки, без LOAD_HINT/GPU) + 60Hz FIXED_SOURCE
+          # 1. android_perf.c: чистый ADPF full (все игровые потоки, без LOAD_HINT/GPU и без сброса герцовки)
           pf = Path('games/totk/runtime/android_perf.c')
           pt = pf.read_text()
 
@@ -124,19 +124,9 @@ jobs:
           assert old_mode in pt, 'Строка mode не найдена в android_perf.c'
           pt = pt.replace(old_mode, new_mode, 1)
 
-          old_rate_cfg = 'rate_on = is_one("TOTK_FRAME_RATE_HINT"); fps60 = is_one("TOTK_FPS60");'
-          new_rate_cfg = 'fps60 = is_one("TOTK_FPS60"); rate_on = fps60 || is_one("TOTK_FRAME_RATE_HINT");'
-          assert old_rate_cfg in pt, 'Строка rate_on не найдена в android_perf.c'
-          pt = pt.replace(old_rate_cfg, new_rate_cfg, 1)
-
-          old_rate_ret = 'return override ? override : atomic_load_explicit(&content_rate, memory_order_relaxed);'
-          new_rate_ret = 'return override ? override : (fps60 ? 60.0f : atomic_load_explicit(&content_rate, memory_order_relaxed));'
-          assert old_rate_ret in pt, 'Строка totk_perf_rate не найдена в android_perf.c'
-          pt = pt.replace(old_rate_ret, new_rate_ret, 1)
-
           pf.write_text(pt)
 
-          # 2. TotkActivity.java: замок окна на 60 Гц + запрет сна экрана
+          # 2. TotkActivity.java: жёсткий замок окна на 120 Гц + запрет сна экрана
           ja = Path('games/totk/android/java/com/aure/totk/TotkActivity.java')
           jt = ja.read_text()
           if jt.startswith('Package '):
@@ -145,18 +135,18 @@ jobs:
               jt = jt.replace('import android.view.View;', 'import android.view.View;\nimport android.view.WindowManager;', 1)
 
           lock_method = """
-              private void lock60HzDisplay() {
+              private void lock120HzDisplay() {
                   getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                   Display display = getDisplay();
                   if (display == null) return;
                   Display.Mode current = display.getMode();
                   if (current == null) return;
                   Display.Mode target = current;
-                  float bestDiff = Math.abs(current.getRefreshRate() - 60.0f);
+                  float bestDiff = Math.abs(current.getRefreshRate() - 120.0f);
                   for (Display.Mode m : display.getSupportedModes()) {
                       if (m.getPhysicalWidth() == current.getPhysicalWidth()
                               && m.getPhysicalHeight() == current.getPhysicalHeight()) {
-                          float diff = Math.abs(m.getRefreshRate() - 60.0f);
+                          float diff = Math.abs(m.getRefreshRate() - 120.0f);
                           if (diff < bestDiff) {
                               bestDiff = diff;
                               target = m;
@@ -172,9 +162,9 @@ jobs:
               }
           """
           jt = jt.replace('@Override protected void onCreate(Bundle state) {', lock_method + '\n    @Override protected void onCreate(Bundle state) {', 1)
-          jt = jt.replace('super.onCreate(state);', 'super.onCreate(state);\n        lock60HzDisplay();', 1)
-          jt = jt.replace('resumed = true;', 'resumed = true;\n        lock60HzDisplay();', 1)
-          jt = jt.replace('super.onWindowFocusChanged(focused);', 'super.onWindowFocusChanged(focused);\n        if (focused) lock60HzDisplay();', 1)
+          jt = jt.replace('super.onCreate(state);', 'super.onCreate(state);\n        lock120HzDisplay();', 1)
+          jt = jt.replace('resumed = true;', 'resumed = true;\n        lock120HzDisplay();', 1)
+          jt = jt.replace('super.onWindowFocusChanged(focused);', 'super.onWindowFocusChanged(focused);\n        if (focused) lock120HzDisplay();', 1)
           ja.write_text(jt)
 
           # 3. Оптимизация компилятора (-O3 + ThinLTO)
@@ -186,7 +176,7 @@ jobs:
           br.write_text(br.read_text().replace(
               "'GPU=vk', f'DEV_BUILD={0 if release else 1}'",
               "'GPU=vk', 'LTO=thin', f'DEV_BUILD={0 if release else 1}'", 1))
-          print('Конфигурация (60Hz lock + чистый ADPF full + -O3/ThinLTO) успешно применена')
+          print('Конфигурация (120Hz lock + чистый ADPF full + -O3/ThinLTO) успешно применена')
           PY
 
       - name: Сборка APK
